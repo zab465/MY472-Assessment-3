@@ -1,0 +1,770 @@
+---
+title: "Assignment - 3"
+output: html_document
+date: "2023-12-17"
+---
+
+```{r setup, include=FALSE, eval = TRUE, echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+```{r, eval = TRUE, message = FALSE, warning=FALSE}
+# Packages for the project 
+library(xml2)
+library(tidyverse)
+library(dplyr)
+library(RSelenium)
+library(rvest)
+library(spotifyr)
+library(DBI)
+library(RSQLite)
+library(ggplot2)
+library(corrplot)
+library(RColorBrewer)
+```
+
+Here is the link to the public [repository](https://github.com/zab465/MY472-Assessment-3.git) 
+
+## Spotify and Rolling Stone Magazine
+
+Rolling Stone Magazine ranked their 100 greatest musical artists of all time. At the end of 2023, how has their music endured? Are there any features or characteristics that seem to explain enduring engagement?
+
+#### Introduction 
+In this report I investigate the endurance of Rolling Stone's ranked 100 “greatest” artists. I explore specific features of these artists and their tracks to explain their lasting impact. I use Spotify's popularity indicator (play counts combined with recency) in 2023 as a proxy for endurance. I am to distinguish enduring from outdated artists and delve into their musical/personal features which might foster this.
+
+#### Data Collection 
+
+I gather data from Rolling Stone Magazine, Spotify's API (using the spotifyr R package), and the Grammy Awards dataset spanning 1958-2019 from a CSV file by Fontes (2019). I scrape artist rankings from the magazine, store them in my spotify_db database, and use Spotify's API to retrieve details like genres, popularity, follower count, top tracks in the US, and audio features for the top 100 artists. The resulting tables are saved in my relational database. Additionally, I clean the Grammy Awards CSV file obtained from an [open data repository](https://www.kaggle.com/datasets/unanimad/grammy-awards), focusing on information related to the top 100 artists from 1958 to 2019, and store it in the same database.
+
+```{r}
+# Scraper function for the Rollingstone magazine
+scrape_artist_ranking <- function(url) {
+  # Start the Selenium driver
+  rD <- rsDriver(browser = "firefox", verbose = FALSE, port = netstat::free_port(random = TRUE), chromever = NULL)
+  driver <- rD[["client"]]
+  
+  # Initialize an empty data frame with column names
+  artist_ranking <- data.frame(Rank = integer(), Artist = character(), stringsAsFactors = FALSE)
+  
+  # Navigate to the selected URL address
+  driver$navigate(url)
+  Sys.sleep(2)
+  
+  # Close cookies consent
+  close_cookies <- driver$findElement(using = "xpath", value = '//*[@id="onetrust-accept-btn-handler"]')
+  close_cookies$clickElement()
+  
+  # Loop over the entire range (1 to 100)
+  for (i in 1:100) {
+    # Determine the XPath based on the position
+    # "load more" button at the bottom of the page means xpaths change even if it's infinite scroll
+    xpath <- if (i <= 50) {
+      paste0('//*[@id="pmc-gallery-vertical"]/div[1]/div/div[', i, ']/article/h2')
+    } else {
+      paste0('//*[@id="pmc-gallery-vertical"]/div[2]/div/div[', i - 50, ']/article/h2')
+    }
+    
+    # Find artist element using the constructed XPath
+    artist_element <- driver$findElement(using = "xpath", value = xpath)
+    
+    # Get the text of the artist element
+    artist_name <- artist_element$getElementText()
+    
+    # Add a row to the result data frame
+    artist_ranking <- rbind(artist_ranking, c(i, artist_name))
+    
+    # Click "Load More" button after the first 50 iterations
+    if (i == 50) {
+      load_more <- driver$findElement(using = "xpath", value = '//*[@id="pmc-gallery-vertical"]/div[2]/a')
+      load_more$clickElement()
+      # Wait for the new page to load
+      Sys.sleep(2)
+    }
+  }
+  
+  # Switch the ordering of the artist names
+  artist_ranking <- artist_ranking %>%
+    rename(Artist = X.Talking.Heads., Rank= X1L) %>%
+    mutate(Artist = ifelse(Artist == "Parliament and Funkadelic", "Parliament Funkadelic", Artist), Artist = rev(Artist))
+  
+  # Stop the Selenium driver
+  rD[["server"]]$stop()
+  
+  # Return the result data frame
+  return(artist_ranking)
+}
+```
+```{r}
+# Call the function with the provided URL
+page_url <- "https://www.rollingstone.com/music/music-lists/100-greatest-artists-147446/"
+artist_ranking <- scrape_artist_ranking(page_url)
+```
+
+
+```{r}
+# From the artist names in Rollingstone get the spotify IDs
+# Authenticate with Spotify and obtain an access token
+  # Read the Spotify API credentials from Renviron
+  
+readRenviron("Documents/myenvs/spotifyapi.env.R")
+clientID <- Sys.getenv("SPOTIFY_CLIENT_ID")
+spot_key <- Sys.getenv("SPOTIFY_CLIENT_SECRET")
+
+# Set Spotify API credentials
+Sys.setenv(SPOTIFY_CLIENT_ID = clientID)
+Sys.setenv(SPOTIFY_CLIENT_SECRET = spot_key)
+
+# Authenticate with Spotify and obtain an access token
+access_token <- get_spotify_access_token()
+get_spotify_ids <- function(artist_ranking) {
+  
+  # Extract the Artist column as a vector
+  artist_names <- artist_ranking$Artist
+  
+  # Initialize an empty list to store the results
+  result_list <- list()
+  
+  # Search for artists and retrieve their Spotify IDs
+  for (artist in artist_names) {
+    artist_data <- search_spotify(
+      artist,
+      type = "artist",
+      authorization = access_token
+    )
+    
+    # Extract the first result
+    if (nrow(artist_data) > 0) {
+      spotify_id <- artist_data$id[1]
+      result_list[[artist]] <- data.frame(Artist = artist, Spotify_ID = spotify_id, stringsAsFactors = FALSE)
+    } else {
+      # Handle the case where no result is found
+      result_list[[artist]] <- data.frame(Artist = artist, Spotify_ID = NA, stringsAsFactors = FALSE)
+    }
+  }
+  
+  # Combine the list of data frames into one data frame
+  artist_ids <- do.call(rbind, result_list)
+  
+  # Remove row names
+  rownames(artist_ids) <- NULL
+  
+  return(artist_ids)
+}
+# Call the function with the provided artist_ranking data frame
+artist_ids <- get_spotify_ids(artist_ranking)
+```
+
+```{r}
+# Function that will extract the artist "catalogue" from Spotify 
+# will use the artist IDs to get all the other artist information 
+get_artist_catalogue <- function(artist_ids) {
+  # Extract the artist IDs from the previous API call table 
+  artist_id_list <- artist_ids$Spotify_ID
+  
+  # Create an empty data.frame to store the results 
+  get_artists_table <- data.frame()
+  
+  # Using the get_artists method from the API, which will return from the ID, 
+  # the popularity, genre, and followers of the artists
+  for (j in artist_id_list[1:50]) {
+    artist_data <- get_artists(
+      j,
+      authorization = get_spotify_access_token()
+    )
+    
+    # add to the dataframe 
+    get_artists_table <- bind_rows(get_artists_table, artist_data)
+  }
+  
+  # Need 2 for loops because the get_artists call is limited to 50 IDs 
+  # Repeat the above procedure from artists pos. 51-100
+  get_artists_table2 <- data.frame()
+  
+  for(j in artist_id_list[51:100]){
+    artist_data2 <- get_artists(
+      j,
+      authorization = get_spotify_access_token()
+    )
+    
+    get_artists_table2 <- bind_rows(get_artists_table2, artist_data2)
+  }
+  
+  # combine both tables, with table2 at the "bottom" of table 1
+  artist_catalogue <- rbind(get_artists_table, get_artists_table2)
+  
+  # select relevant columns 
+  # unnest the genres column to have tidy-long data where each row is a genre-artist combination 
+  artist_catalogue <- artist_catalogue %>%
+    unnest(genres) %>%
+    select(-href, -images, -uri, -external_urls.spotify, -followers.href)
+  
+  return(artist_catalogue)
+}
+
+# Call the function with the provided artist_ids data frame
+artist_catalogue <- get_artist_catalogue(artist_ids)
+```
+
+```{r message = FALSE}
+# Getting the top tracks per artist in the US "market"
+# US is the largest Spotify market
+get_top_tracks_us <- function(artist_id_list) {
+  # Initialize an empty dataframe
+  get_top_tracks <- data.frame()
+  
+  # Loop for the first 50 artists
+  for (i in artist_id_list[1:50]) {
+    top_tracks <- get_artist_top_tracks(
+      i,
+      market = "US",
+      authorization = get_spotify_access_token()
+    )
+    
+    # Unnest the results
+    # Make a new column for co-artists containing the number of "participants" for each track 
+    top_tracks <- top_tracks %>% 
+      unnest_wider(artists, names_sep = "_") %>%
+      mutate(
+        co_artists = map_dbl(artists_id, length),
+        artists_id = map_chr(artists_id, ~ ifelse(length(.) > 0, toString(.[1]), NA_character_))
+      )
+    
+    # Convert columns to character to ensure consistency
+    top_tracks <- mutate_all(top_tracks, as.character)
+    
+    # Identify the ID column dynamically
+    id_column <- intersect(names(top_tracks), names(get_top_tracks))
+    
+    # Check for unique IDs before appending to the dataframe
+    unique_top_tracks <- anti_join(top_tracks, get_top_tracks, by = id_column)
+    
+    # Append to the dataframe
+    get_top_tracks <- bind_rows(get_top_tracks, unique_top_tracks)
+  }
+  
+  # Loop for the next 50 artists
+  for (j in artist_id_list[51:100]) {
+    top_tracks <- get_artist_top_tracks(
+      j,
+      market = "US",
+      authorization = get_spotify_access_token()
+    )
+    
+    # Unnest the results
+    # Make a new column for co-artists containing the number of "participants" for each track 
+    top_tracks <- top_tracks %>% 
+      unnest_wider(artists, names_sep = "_") %>%
+      mutate(
+        co_artists = map_dbl(artists_id, length),
+        artists_id = map_chr(artists_id, ~ ifelse(length(.) > 0, toString(.[1]), NA_character_))
+      )
+    
+    # Convert columns to character to ensure consistency
+    top_tracks <- mutate_all(top_tracks, as.character)
+    
+    # Identify the ID column dynamically
+    id_column <- intersect(names(top_tracks), names(get_top_tracks))
+    
+    # Check for unique IDs before appending to the dataframe
+    unique_top_tracks <- anti_join(top_tracks, get_top_tracks, by = id_column)
+    
+    # Append to the dataframe
+    get_top_tracks <- bind_rows(get_top_tracks, unique_top_tracks)
+  }
+  
+  # Convert to tibble and select relevant columns
+  get_top_tracks <- get_top_tracks %>% select(
+    artists_id, duration_ms, explicit, id, name, popularity, track_number, album.album_type, album.id, album.name, album.release_date, album.release_date_precision, album.total_tracks, album.type, co_artists
+  )
+  
+  return(get_top_tracks)
+}
+
+artist_id_list <- artist_ids$Spotify_ID
+# Call the function with the provided artist_id_list
+top_tracks_us <- get_top_tracks_us(artist_id_list)
+```
+
+```{r}
+# Function that will get the top track table with all the markets, using track ids from the US market data 
+get_top_track_table_with_markets <- function() {
+  # Extracting track IDs from the top_tracks_us data frame
+  unique_track_ids <- unique(top_tracks_us$id)
+  
+  # Initialize an empty data frame to store market information
+  track_markets <- data.frame()
+  
+  # Loop through each unique track ID
+  for (i in unique_track_ids) {
+    top_track_markets <- get_tracks(
+      i,
+      market = NULL,
+      authorization = get_spotify_access_token()
+    )
+    
+    # Calculate available markets count for both track and album
+    top_track_markets_flat <- top_track_markets %>%
+      mutate(available_markets_count = lengths(available_markets)) %>%
+      mutate(album.available_markets_count = lengths(album.available_markets)) %>%
+      distinct(id, .keep_all = TRUE)
+    
+    # Append to the track_markets data frame
+    track_markets <- bind_rows(track_markets, top_track_markets_flat)
+  }
+  
+  # Join the track and album market info to the top_tracks_us table
+  top_track_table <- left_join(
+    top_tracks_us,
+    track_markets %>%
+      select(id, available_markets_count, album.available_markets_count),
+    by = "id"
+  )
+  
+  return(top_track_table)
+}
+
+# Call the function
+top_track_table <- get_top_track_table_with_markets()
+```
+
+```{r}
+# joining the track and album market info to the tracks table 
+top_track_table_joined <- left_join(top_tracks_us, top_track_table %>%
+                      select(id, available_markets_count, album.available_markets_count),
+                    by = "id")
+```
+
+```{r}
+# Using the get_track_audio_features which takes max 100 song IDs to get info on all top songs 
+# Looping over batches of data to match query requirement 
+
+# song IDs directly from pre-existing table 
+song_ids <- top_track_table_joined$id
+
+# Function to retrieve the audio features 
+get_audio_feat <- function(song_ids) {
+  # initialize data frame
+  tracks_audio <- data.frame()
+
+  # determine the number of batches based on the API limit
+  batch_size <- 100
+  num_batches <- ceiling(length(song_ids) / batch_size)
+
+  # loop over batches
+  for (batch in 1:num_batches) {
+    # get start and end indices for the current batch
+    start_index <- (batch - 1) * batch_size + 1
+    end_index <- min(batch * batch_size, length(song_ids))
+
+    # extract song IDs for the current batch
+    current_batch_ids <- song_ids[start_index:end_index]
+
+    # loop over song IDs in the current batch to get the features
+    for (j in current_batch_ids) {
+      tracks_audio_feat <- get_track_audio_features(
+        j,
+        authorization = get_spotify_access_token()
+      )
+      # append to dataframe
+      tracks_audio <- bind_rows(tracks_audio, tracks_audio_feat)
+    }
+  }
+
+  return(tracks_audio)
+}
+
+# Call the function with your song IDs
+tracks_audio <- get_audio_feat(song_ids)
+
+# clean output to contain only relevant elements before uploading to database
+tracks_audio <- tracks_audio %>%
+  select(-analysis_url, -track_href, -uri, -type)
+```
+
+```{r warning = FALSE, message = FALSE}
+# data source: https://www.kaggle.com/datasets/unanimad/grammy-awards/versions/2?resource=download
+gram <- read.csv("the_grammy_awards.csv")
+
+# from gram selecting only the rows that pertain to the artists in Rollingstone magazine
+artist_names <- artist_ids$Artist
+
+# establish regex pattern to capture the different variations of the artist's name
+regex_patterns <- paste0("\\b", artist_names, "\\b(?!(\\s*:|\\s+Anthology))", collapse = "|")
+
+# Filter rows based on the regex patterns
+# Fill empty values in the "workers" column with the corresponding values from the "nominee" column
+grammys_filtered <- gram %>%
+  mutate(workers = ifelse(workers == "", nominee, workers)) %>%
+  filter(str_detect(workers, regex_patterns)) %>%
+  mutate(win_or_nomination = ifelse(winner, "Win", "Nomination"))
+
+# Summary table saved as final table to count the number of wins and nominations for each artist that is in the list
+summary_grammys <- grammys_filtered %>%
+  mutate(artist = str_extract(workers, regex_patterns)) %>%
+  group_by(artist, win_or_nomination) %>%
+  summarize(count = sum(n())) %>%
+  pivot_wider(names_from = win_or_nomination, values_from = count, values_fill = 0)
+```
+
+```{r}
+# create a new database and write all the tables to the database separately
+spotify_db <- DBI::dbConnect(RSQLite::SQLite(), "spotify_db.db")
+
+#checking that the database created exists 
+file.exists("spotify_db.db")
+
+# write the rankings table 
+dbWriteTable(spotify_db, "artist_rankings", artist_ranking)
+
+# write the artist_ids table 
+dbWriteTable(spotify_db, "artist_ids", artist_ids)
+
+# write the artist_catalogue table containing info about artists 
+dbWriteTable(spotify_db, "artist_stats", artist_catalogue)
+
+# write the top tracks information table per artist
+dbWriteTable(spotify_db, "top_tracks_stats", top_track_table_joined)
+
+# write the audio features per (top) track
+dbWriteTable(spotify_db, "top_track_audio_feat", tracks_audio)
+
+# Write the grammys data set 
+dbWriteTable(spotify_db, "grammy_stats", summary_grammys)
+```
+
+```{r,}
+# Function to check the existence and dimensionality of a table in a database
+check_table <- function(db_connection, table_name) {
+  # Check if the table exists
+  table_exists <- dbExistsTable(db_connection, table_name)
+
+  if (table_exists) {
+    # If the table exists, fetch its dimensionality
+    query <- paste("PRAGMA table_info(", table_name, ");", sep = "")
+    table_info <- dbGetQuery(db_connection, query)
+
+    # Calculate the number of rows
+    query_rows <- paste("SELECT COUNT(*) AS num_rows FROM", table_name)
+    num_rows <- dbGetQuery(db_connection, query_rows)$num_rows
+
+    # Print the results
+    cat(paste("Table", table_name, "exists.\n"))
+    cat("Number of rows:", num_rows, "\n")
+    cat("Number of columns:", nrow(table_info), "\n")
+  } else {
+    cat(paste("Table", table_name, "does not exist.\n"))
+  }
+}
+```
+```{r}
+# Checking that individual tables exist 
+db_connection <- dbConnect(RSQLite::SQLite(), dbname = "spotify_db.db")
+
+# Specify the table name you want to check
+table_check_1 <- "artist_rankings"
+table_check_2 <- "artist_ids"
+table_check_3 <- "artist_stats"
+table_check_4 <- "top_tracks_stats"
+table_check_5 <- "top_track_audio_feat"
+
+# Call the function for each table in the DB
+check_table(db_connection, table_check_1)
+check_table(db_connection, table_check_2)
+check_table(db_connection, table_check_3)
+check_table(db_connection, table_check_4)
+check_table(db_connection, table_check_5)
+
+# disconnect 
+dbDisconnect(db_connection)
+```
+
+#### Data Analysis
+
+Initially, Spotify's artist popularity indicators are "absolute;” they compare a track’s performance to all other Spotify tracks. I adjust it to a relative measure according to the distribution of popularity scores in Figure 1 below.
+
+```{r, eval = TRUE, warning = FALSE}
+# connect to db
+spotdb <- dbConnect(RSQLite::SQLite(), "spotify_db.db")
+
+# Get the artist popularity from SQL query 
+unique_pop <- dbGetQuery(spotdb, "SELECT DISTINCT(id), popularity
+           FROM artist_stats")
+# Plot distribution with density
+ggplot(unique_pop, aes(x = popularity)) +
+  geom_density(binwidth = 5, fill = "blue", alpha = 0.7) +
+  labs(title = "Figure 1: Popularity Distribution of Artists", x = "Popularity", y = "Frequency") + 
+  theme_minimal()
+```
+
+Most of the data being after the mean, I choose to divide the popularity measures into quartiles (very low popularity, low popularity, popular, very popular) to distinguish popularity amongst a popular group. 
+
+```{r}
+# divide the popularity variable into quartiles with custom names
+unique_pop$popularity_quartile <- cut(unique_pop$popularity, 
+                                      breaks = quantile(unique_pop$popularity, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), 
+                                      labels = c("Very Low", "Low", "Popular", "Very Popular"))
+
+# Create a temporary table with the new data
+dbWriteTable(spotdb, "temp_artist_stats", unique_pop, append = TRUE,)
+
+# Update the existing table with the new column
+dbExecute(spotdb,"UPDATE artist_stats
+      SET popularity_quartile = (
+        SELECT popularity_quartile
+        FROM temp_artist_stats
+        WHERE artist_stats.id = temp_artist_stats.id
+      )" 
+      )
+
+# Drop the temporary table
+dbExecute(spotdb, "DROP TABLE IF EXISTS temp_artist_stats")
+
+# connect to db
+db_connection <- dbConnect(RSQLite::SQLite(), "spotify_db.db")
+
+# Check that it worked: 
+check_table(db_connection, table_check_3)
+```
+
+
+```{r,eval=TRUE}
+# connect to database
+spotdb <- dbConnect(RSQLite::SQLite(), "spotify_db.db")
+
+# Query to select name, id, popularity and quartile of artists
+endure1 <- dbGetQuery(spotdb, "SELECT DISTINCT(id), name, popularity, popularity_quartile
+           FROM artist_stats
+           WHERE popularity_quartile LIKE 'Very Popular' OR popularity_quartile LIKE 'Popular'
+           ORDER BY popularity DESC")
+
+# print nicely the number of artists in the top 2 quartiles
+cat("The number of artists who fall into the Very Popular or Popular quartiles is",length(endure1$name))
+```
+
+50 artists fall in the top 50% popularity scores, suggesting 50% of the "best artists of all time" endured through 2023 under this definition. Considering the measure reflects entire discographies, I repeat the process for only artists’ top 10 tracks, limiting the downward effect of unpopular/remastered tracks.
+
+
+```{r eval=TRUE}
+# Query to get the popularity of the tracks only 
+distr_tracks <-dbGetQuery(spotdb, "SELECT popularity, artists_id
+                          FROM top_tracks_stats")
+
+# Convert to numeric to ensure all is correctly formatted
+distr_tracks$popularity <- as.numeric(distr_tracks$popularity)
+# Create a histogram
+ggplot(distr_tracks, aes(x = popularity)) +
+  geom_histogram(fill = "lightblue", color = "grey", alpha = 0.7, bins = 50) +
+  labs(title = "Figure 2: Track Popularity Distribution", x = "Track Popularity Score", y = "Count") +
+  theme_minimal()
+```
+
+As Figure 2 illustrates, most scores are on the right-hand-side of the mean; top tracks are unsurprisingly quite popular among Spotify users. I make relative measures of these track popularity scores using split as I did earlier and update the database.
+
+```{r}
+# divide the popularity for tracks into quartiles with custom names
+distr_tracks$popularity_quartile <- cut(distr_tracks$popularity, 
+                                      breaks = quantile(distr_tracks$popularity, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE), 
+                                      labels = c("Very Low", "Low", "Popular", "Very Popular"))
+
+# Create a temporary table with the new data
+dbWriteTable(spotdb, "temp_track_stats", distr_tracks, append = TRUE, row.names = FALSE)
+
+# Check if the column exists
+col_exists <- dbGetQuery(spotdb, 'PRAGMA table_info("top_tracks_stats")')$name %in% "popularity_quartile"
+
+# If the column doesn't exist, add it
+if (!any(col_exists)) {
+  dbExecute(spotdb, 'ALTER TABLE top_tracks_stats ADD COLUMN popularity_quartile TEXT;')
+}
+
+# Update the existing table with the new column
+dbExecute(spotdb, '
+  UPDATE top_tracks_stats
+  SET popularity_quartile = temp_track_stats.popularity_quartile
+  FROM temp_track_stats
+  WHERE top_tracks_stats.id = temp_track_stats.artists_id;
+')
+
+
+# Drop the temporary table
+dbExecute(spotdb, "DROP TABLE IF EXISTS temp_track_stats")
+
+db_connection <- dbConnect(RSQLite::SQLite(), "spotify_db.db")
+# Check that it worked: 
+check_table(db_connection, table_check_4)
+```
+```{r eval=TRUE}
+# connect to DB and look at what proportion of songs per artist have high popularity or are popular (top 50%)
+spotdb <- dbConnect(RSQLite::SQLite(), "spotify_db.db")
+
+pop_tracks <- dbGetQuery(spotdb, " SELECT 
+                      DISTINCT track.name, 
+                      art.name, 
+                      track.artists_id, 
+                      track.popularity, 
+                      track.popularity_quartile
+                      FROM top_tracks_stats AS track
+                      LEFT JOIN artist_stats AS art ON art.id = track.artists_id
+                      WHERE track.popularity_quartile LIKE 'Very Popular' OR track.popularity_quartile LIKE 'Popular' AND art.name IS NOT NULL
+                      ORDER BY track.popularity DESC")
+# Print nicely the number of artists
+cat("The number of artists in the list having at least one popular and one very popular song is:", length(unique(pop_tracks$artists_id)))
+```
+
+Thus, 85% of artists have at least one "very popular" song, a sign of relative endurance in the group. However, numerous popular songs are duplicates, remixes, covers or remasters, suggesting low diversity—an important selection criterion in Rolling-Stone. Considering this, overall artist popularity is a more suitable measure. Consequently, about 50% of artists in the list can be considered to have truly endured up to the standard of the "best artists of all time."
+
+Second, following the importance of diversity, genre variety increases an artist's exposure across audiences, potentially contributing to their endurance in 2023.
+
+```{r, eval=TRUE, fig.width=10, fig.height=8, warning = FALSE}
+# Query to select the number of genres, popularity, name and quartiles of all artists
+genre_pop1 <- dbGetQuery(spotdb, "SELECT COUNT(genres) AS genres_count, popularity, name, popularity_quartile
+FROM artist_stats
+GROUP BY name")
+
+# ensuring any NAs in the quartiles go into the very low range
+genre_pop1 <- genre_pop1 %>%
+  mutate(popularity_quartile = ifelse(is.na(popularity_quartile), "Very Low", as.character(popularity_quartile)))
+
+# Plot the genre number against popularity, grouping by popularity quartiles per artist 
+ggplot(genre_pop1, aes(x = genres_count, y = popularity, color = popularity_quartile)) +
+  geom_point(aes(size = genres_count), alpha = 0.4, position = position_jitter(width = 0.1, height = 0.2)) +
+  scale_size_continuous(range = c(3, 15)) +  # Keep size legend
+  geom_smooth(method = "lm", se = FALSE, color = "darkgrey", linetype = "dotted", alpha = 0.7, show.legend = FALSE) +  
+  coord_cartesian(ylim = c(30, 100), xlim = c(0, 10)) +
+  labs(title = "Figure 3: Bubble Chart of Genres and Popularity per Artist",
+       x = "Number of Genres",
+       y = "Popularity",
+       caption = "Bubble size = Number of Genres") +
+  theme_minimal() +
+  scale_color_manual(values = c("Very Popular" = "purple", 
+                                "Very Low" = "deepskyblue2", 
+                                "Popular" = "darkorange", 
+                                "Low" = "hotpink")) +
+  guides(color = guide_legend(title = "Quartile Legend"), size = FALSE)
+```
+
+Figure 3 shows that artists playing more genres tend to be less popular, especially evident in the top popularity quartile, which generally has fewer genres. A clear division exists between popularity quartiles and genre counts. High endurance is not attributable to high genre diversity, but lower diversity may contribute to high endurance.
+
+Third, song availability, particularly for those songs that fans deem “special” or out of character, may contribute to endurance by sustaining fan access and praise.
+
+```{r, eval=TRUE, warning = FALSE}
+ind_av_mrkt_count1 <- dbGetQuery(spotdb, "SELECT ROUND(AVG(t.available_markets_count), 1) AS Average_Market_Count, t.artists_id, a.name, a.popularity_quartile, a.popularity
+           FROM top_tracks_stats as t 
+           LEFT JOIN artist_stats AS a ON a.id = t.artists_id
+           GROUP BY t.artists_id")
+
+ind_av_mrkt_count1 <- ind_av_mrkt_count1 %>%
+  mutate(popularity_quartile = ifelse(is.na(popularity_quartile), "Very Low", as.character(popularity_quartile)))
+
+ggplot(ind_av_mrkt_count1, aes(x = Average_Market_Count, y = popularity)) + 
+  geom_point(aes(color = popularity_quartile)) + 
+  geom_smooth(method = "lm", se = TRUE, linetype = "dotted", color = "grey", fill = "bisque2", show.legend = FALSE) + 
+  labs(title = "Figure 4: Artist Popularity and Average Market Availability",
+       x = "Top Tracks' Market Availability", y = "Artist Popularity") + 
+  theme_minimal() +
+  facet_wrap(~popularity_quartile, scales = "free")
+cat("Mean market access across all artists:", round(mean(ind_av_mrkt_count1$Average_Market_Count), 2))
+cat("\nRange of market access across all artists:", range(ind_av_mrkt_count1$Average_Market_Count))
+```
+
+In Figure 4, top track availability spans 1 to 184 (Spotify's maximum markets). The mean, 163.85, indicates widespread global availability, likely contributing to sustained popularity in 2023. While increased market access benefits very low-popularity artists, the trend reverses for very high and low-popularity artists. This suggests that, for the most enduring artists, market availability doesn't significantly contribute to endurance, likely due to their established global presence. For lesser-known artists, however, it may present an opportunity. It can thus not explain the endurance of the top 50 artists. 
+
+Fourth, endurance could be a product of particular combination of audio features.
+
+```{r, eval=TRUE}
+audio_feat_combined <- dbGetQuery(spotdb, "SELECT 
+f.danceability AS Danceability, 
+                    f.energy AS Energy, 
+                    f.tempo AS Tempo, 
+                    f.duration_ms AS Duration_ms, 
+                    f.valence AS Positivity, 
+                    f.loudness AS Loudness, 
+                    f.speechiness AS Speechiness, 
+                    f.acousticness AS Acousticness,
+                    f.instrumentalness AS Instrumentalness,
+                    a.popularity AS Artist_pop,
+                    t.co_artists AS Co_artists, 
+                    t.popularity AS Track_pop 
+FROM top_track_audio_feat AS f
+           LEFT JOIN top_tracks_stats AS t
+                  ON t.id = f.id
+           LEFT JOIN artist_stats AS a 
+                  ON t.artists_id = a.id
+          WHERE a.popularity_quartile LIKE 'Very Popular' OR a.popularity_quartile LIKE 'Popular'
+          GROUP BY t.id
+")
+# ensure all variables are numeric before using the correlation matrix
+audio_feat_combined$Co_artists <- as.numeric(audio_feat_combined$Co_artists)
+audio_feat_combined$Track_pop <- as.numeric(audio_feat_combined$Track_pop)
+
+# correlation matrix for all variables in the table for all artists' whose popularity is "popular" and "very popular"
+# ie. top 25 artists
+correlation_matrix <- cor(audio_feat_combined)
+# corrplot of variables, each one with all the others
+corrplot(correlation_matrix, 
+         method = "color", 
+         type = "upper", 
+         order = "hclust",
+         main = "Figure 5: Correlation Matrix of Top 25 Artists' Top \n Tracks' Audio Features and Popularity",
+         tl.col = "black", 
+         tl.srt = 45, 
+         cl.cex = 0.7,
+         col = brewer.pal(n = 8, name = "PRGn"), 
+         mar = c(1, 1, 3.5, 2), 
+         tl.cex = 0.8,
+         cl.align.text = "l", 
+         cl.offset = 0.3
+) 
+```
+
+Figure 5 reveals significant correlations only between energy and acousticness, and energy and loudness among the top 50 artists' tracks. No significant correlation exists between popularity and any other variable. While based only on 10 tracks, it is expected that top-performing tracks reflect endurance-inducive characteristics.
+
+
+Finally, a potential key to understanding an artist's endurance lies in their reputation. Acknowledging the cyclical nature of reputation and popularity, I propose the concept of reputation-validation—sustaining endurance through awards, prizes, and positive commentary. To explore this, I examine Grammy Award data.
+
+```{r, eval=TRUE, fig.width=12, fig.height=8}
+# SQL query to combine artist names with popularity quartile to extract only the grammy data 
+# Not all artists have Grammy data
+nominations_grammys <- dbGetQuery(spotdb, "SELECT g.artist, 
+            g.win, 
+            g.nomination, 
+            a.popularity_quartile
+            FROM grammy_stats AS g
+           LEFT JOIN artist_stats AS a 
+           ON a.name = g.artist
+           GROUP BY g.artist")
+
+# turn the output into long format to be able to position bars next to each other on the same pane
+nominations_long <- nominations_grammys %>%
+  gather(key = "variable", value = "value", Win, Nomination)
+
+# Remove missing values from analysis 
+nominations_long <- na.omit(nominations_long)
+
+# Ensure popularity_quartile is a factor with proper ordering
+nominations_long$popularity_quartile <- factor(
+  nominations_long$popularity_quartile,
+  levels = c("Very Popular", "Popular", "Low", "Very Low")  # Adjust these levels based on your data
+)
+
+# Plot artists nominations and wins for grammys between 1958 and 2019
+# Some artists are more "recent" and will have naturally gathered less prizes but the trends are useful 
+ggplot(nominations_long, aes(x = factor(artist), y = value, fill = variable)) +
+  geom_bar(position = "dodge", stat = "identity", alpha = 0.8) +
+  scale_fill_manual(values = c("Win" = "lightpink", "Nomination" = "purple"), 
+                    labels = c("Nominations with no Win", "Nomination with win")) +
+  scale_y_continuous(minor_breaks = seq(0, max(nominations_long$value), by = 1)) +
+  theme(axis.text.x = element_text(angle = 75, hjust = 1)) +
+  labs(fill = "Legend", title = "Figure 6: Grammy Award Wins and Nominations per Artist", y = "Frequency", x = "Artists") +
+  facet_wrap(~popularity_quartile, scales = "free_x")
+```
+
+Figure 6 indicates that popular/very popular artists exhibit high levels of wins and nominations, suggesting significant external validation compared to their low/very low popularity counterparts. While the direction of the relationship with endurance remains unclear, a distinct disparity between groups exists, and external validation emerges as a potential factor influencing endurance, though it could be the product of it.
+
+
+### Appendix Code
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+# this chunk generates the complete code appendix. 
+# eval=FALSE tells R not to run (``evaluate'') the code here (it was already run before).
+```
