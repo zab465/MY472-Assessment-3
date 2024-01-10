@@ -497,7 +497,7 @@ ggplot(unique_pop, aes(x = popularity)) +
   theme_minimal()
 ```
 
-Most of the data being after the mean, I choose to divide the popularity measures into quartiles (very low popularity, low popularity, popular, very popular) to distinguish popularity amongst a popular group. 
+The data being slightly negatively skewed, I choose to divide the popularity measures into quartiles (very low popularity, low popularity, popular, very popular) to distinguish popularity levels within an already popular group. 
 
 ```{r}
 # divide the popularity variable into quartiles with custom names
@@ -542,7 +542,7 @@ endure1 <- dbGetQuery(spotdb, "SELECT DISTINCT(id), name, popularity, popularity
 cat("The number of artists who fall into the Very Popular or Popular quartiles is",length(endure1$name))
 ```
 
-50 artists fall in the top 50% popularity scores, suggesting 50% of the "best artists of all time" endured through 2023 under this definition. Considering the measure reflects entire discographies, I repeat the process for only artists’ top 10 tracks, limiting the downward effect of unpopular/remastered tracks.
+50 artists fall in (very) popular categories, half of the "best artists of all time" endured through 2023 under this definition, and that there are outliers affecting the visual distribution of the data. This measure reflects entire discographies, so I repeat the process for  artists’ top 10 tracks, limiting the downward effect of unpopular/remastered tracks.
 
 
 ```{r eval=TRUE}
@@ -609,10 +609,10 @@ pop_tracks <- dbGetQuery(spotdb, " SELECT
                       WHERE track.popularity_quartile LIKE 'Very Popular' OR track.popularity_quartile LIKE 'Popular' AND art.name IS NOT NULL
                       ORDER BY track.popularity DESC")
 # Print nicely the number of artists
-cat("The number of artists in the list having at least one popular and one very popular song is:", length(unique(pop_tracks$artists_id)))
+cat("The number of artists in the list having at least one (very) popular song is:", length(unique(pop_tracks$artists_id)))
 ```
 
-Thus, 85% of artists have at least one "very popular" song, a sign of relative endurance in the group. However, numerous popular songs are duplicates, remixes, covers or remasters, suggesting low diversity—an important selection criterion in Rolling-Stone. Considering this, overall artist popularity is a more suitable measure. Consequently, about 50% of artists in the list can be considered to have truly endured up to the standard of the "best artists of all time."
+Thus, 85% of artists have at least one (very) popular song, a sign of relative endurance in the group. However, numerous popular songs are duplicates, remixes, covers or remasters, suggesting low diversity—an important selection criterion in Rolling-Stone. Considering this, overall artist popularity is a more suitable measure. Consequently, about 50% of artists in the list can be considered to have truly endured up to the standard of the "best artists of all time."
 
 Second, following the importance of diversity, genre variety increases an artist's exposure across audiences, potentially contributing to their endurance in 2023.
 
@@ -718,8 +718,7 @@ corrplot(correlation_matrix,
 ) 
 ```
 
-Figure 5 reveals significant correlations only between energy and acousticness, and energy and loudness among the top 50 artists' tracks. No significant correlation exists between popularity and any other variable. While based only on 10 tracks, it is expected that top-performing tracks reflect endurance-inducive characteristics.
-
+Figure 5 reveals significant correlations only between energy and acousticness, and energy and loudness among the top 50 artists' tracks. Despite having expected endurance-inducive characteristics to manifest in top tracks, no significant correlation exists between popularity and any other variable.
 
 Finally, a potential key to understanding an artist's endurance lies in their reputation. Acknowledging the cyclical nature of reputation and popularity, I propose the concept of reputation-validation—sustaining endurance through awards, prizes, and positive commentary. To explore this, I examine Grammy Award data.
 
